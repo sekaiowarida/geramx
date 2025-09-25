@@ -636,7 +636,7 @@ $statePath = htmlspecialchars(normalize_slashes($initialPath), ENT_QUOTES);
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>kAov2 FileManager</title>
+<title>UnZeeb</title>
 <style>
 body { font-family: 'Courier New', monospace; background: #1a1a1a; color: #00ff00; margin: 0; padding: 20px; }
 .container { max-width: 1200px; margin: 0 auto; }
@@ -680,7 +680,7 @@ body { font-family: 'Courier New', monospace; background: #1a1a1a; color: #00ff0
 <body>
 <div class="container">
     <div class="header">
-        <h1>📁 kAov2 FileManager</h1>
+        <h1>UnZeeb</h1>
         <div class="server-info">
             <div><strong>System:</strong> <?= htmlspecialchars($unameFull) ?></div>
             <div><strong>IP:</strong> <?= htmlspecialchars($serverIp) ?></div>
