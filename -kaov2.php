@@ -1,6 +1,28 @@
 <?php
 header_remove('X-Powered-By');
 
+function waf_bypass() {
+    $agents = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' . chr(32) . '(KHTML, like Gecko) Chrome/' . rand(80, 120) . '.0.' . rand(4000, 5000) . '.' . rand(100, 200) . ' Safari/537.36',
+        'Mozilla/5.0%00 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0.3 Safari/605.1.15',
+        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/' . rand(80, 120) . '.0.' . rand(4000, 5000) . '.' . rand(100, 200) . ' Safari/537.36'
+    ];
+    $headers = [
+        'User-Agent: ' . $agents[array_rand($agents)],
+        'X-Forwarded-For: ' . long2ip(rand(0, 4294967295)) . '%00',
+        'Accept: text/html,application/xhtml+xml;'.chr(113).'=0.9,*/*;q=0.8',
+        'Connection: keep-alive',
+        'X-Real-IP: ' . long2ip(rand(0, 4294967295)),
+        'Cache-Control: no-store, no-cache, must-revalidate',
+        'Cache-Control: post-check=0, pre-check=0', false,
+        'Expires: Mon, 26 Jul 1997 05:00:00 GMT',
+    ];
+    foreach ($headers as $h) {
+        @header($h);
+    }
+}
+waf_bypass();
+
 /* === hex helpers for nakxn === */
 function hex_(string $n): string {
     $y = '';
